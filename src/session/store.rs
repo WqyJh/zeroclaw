@@ -16,6 +16,7 @@ impl SessionId {
         Self(uuid::Uuid::new_v4().to_string())
     }
 
+#[allow(clippy::should_implement_trait)]
     pub fn from_string(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -47,7 +48,8 @@ impl SessionMessageRole {
         }
     }
 
-    pub fn from_str(role: &str) -> Option<Self> {
+#[allow(clippy::should_implement_trait)]
+    pub fn from_str_opt(role: &str) -> Option<Self> {
         match role {
             "user" => Some(Self::User),
             "assistant" => Some(Self::Assistant),
@@ -87,6 +89,10 @@ pub struct SessionRouteMetadata {
     pub route_id: Option<String>,
     pub sender_id: String,
     pub title: Option<String>,
+    pub deliver: bool,
+    pub hop: u32,
+    pub trace_id: Option<String>,
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,16 +108,12 @@ pub struct SessionStore {
     conn: Mutex<Connection>,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 4;
+const SESSION_SCHEMA_VERSION: i64 = 7;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SubagentRunStatus {
-    Queued,
-    Running,
-    Succeeded,
-    Failed,
-    Canceled,
-}
+/// Session state key for the active AgentSpec id (or name) driving this session's turns.
+pub const SESSION_STATE_ACTIVE_AGENT_ID: &str = "active_agent_id";
+/// Session state key for model override: "provider/model" (e.g. "openai/gpt-4o").
+pub const SESSION_STATE_MODEL_OVERRIDE: &str = "model_override";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExecRunStatus {
@@ -135,7 +137,8 @@ impl ExecRunStatus {
         }
     }
 
-    pub fn from_str(status: &str) -> Option<Self> {
+#[allow(clippy::should_implement_trait)]
+    pub fn from_str_opt(status: &str) -> Option<Self> {
         match status {
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
@@ -148,60 +151,13 @@ impl ExecRunStatus {
     }
 }
 
-impl SubagentRunStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Canceled => "canceled",
-        }
-    }
-
-    pub fn from_str(status: &str) -> Option<Self> {
-        match status {
-            "queued" => Some(Self::Queued),
-            "running" => Some(Self::Running),
-            "succeeded" => Some(Self::Succeeded),
-            "failed" => Some(Self::Failed),
-            "canceled" => Some(Self::Canceled),
-            _ => None,
-        }
-    }
-}
-
+/// AgentSpec registry row (multi-agent session switching).
 #[derive(Debug, Clone)]
-pub struct SubagentSession {
-    pub subagent_session_id: String,
-    pub spec_id: Option<String>,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub meta_json: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SubagentSpec {
-    pub spec_id: String,
+pub struct AgentSpec {
+    pub agent_id: String,
     pub name: String,
     pub config_json: String,
     pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SubagentRun {
-    pub run_id: String,
-    pub subagent_session_id: String,
-    pub status: String,
-    pub prompt: String,
-    pub input_json: Option<String>,
-    pub output_json: Option<String>,
-    pub error_message: Option<String>,
-    pub queued_at: String,
-    pub started_at: Option<String>,
-    pub finished_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -442,6 +398,48 @@ impl SessionStore {
             version = 4;
         }
 
+        if version < 5 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_specs (
+                    agent_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_agent_specs_name ON agent_specs(name);",
+            )
+            .context("Failed to apply sessions schema migration v5 (agent_specs)")?;
+            conn.pragma_update(None, "user_version", 5_i64)
+                .context("Failed to set sessions schema version to 5")?;
+            version = 5;
+        }
+
+        if version < 6 {
+            conn.execute_batch(
+                "ALTER TABLE session_meta ADD COLUMN deliver INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE session_meta ADD COLUMN hop INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session_meta ADD COLUMN trace_id TEXT;",
+            )
+            .context("Failed to apply sessions schema migration v6")?;
+            conn.pragma_update(None, "user_version", 6_i64)
+                .context("Failed to set sessions schema version to 6")?;
+            version = 6;
+        }
+
+        if version < 7 {
+            conn.execute_batch(
+                "ALTER TABLE session_meta ADD COLUMN parent_session_id TEXT;
+                 DROP TABLE IF EXISTS subagent_runs;
+                 DROP TABLE IF EXISTS subagent_sessions;
+                 DROP TABLE IF EXISTS subagent_specs;",
+            )
+            .context("Failed to apply sessions schema migration v7")?;
+            conn.pragma_update(None, "user_version", 7_i64)
+                .context("Failed to set sessions schema version to 7")?;
+            version = 7;
+        }
+
         if version != SESSION_SCHEMA_VERSION {
             bail!(
                 "Unsupported sessions schema version {}, expected {}",
@@ -553,9 +551,9 @@ impl SessionStore {
         conn.execute(
             "INSERT INTO session_meta (
                 session_id, agent_id, channel, account_id, chat_type, chat_id, route_id,
-                sender_id, title, created_at, updated_at, last_seen_at
+                sender_id, title, deliver, hop, trace_id, parent_session_id, created_at, updated_at, last_seen_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?14)
              ON CONFLICT(session_id) DO UPDATE SET
                 agent_id = excluded.agent_id,
                 channel = excluded.channel,
@@ -565,6 +563,10 @@ impl SessionStore {
                 route_id = excluded.route_id,
                 sender_id = excluded.sender_id,
                 title = excluded.title,
+                deliver = excluded.deliver,
+                hop = excluded.hop,
+                trace_id = excluded.trace_id,
+                parent_session_id = excluded.parent_session_id,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at",
             params![
@@ -577,6 +579,10 @@ impl SessionStore {
                 metadata.route_id.as_deref(),
                 metadata.sender_id.as_str(),
                 metadata.title.as_deref(),
+                if metadata.deliver { 1_i64 } else { 0_i64 },
+                i64::from(metadata.hop),
+                metadata.trace_id.as_deref(),
+                metadata.parent_session_id.as_deref(),
                 now,
             ],
         )
@@ -590,7 +596,7 @@ impl SessionStore {
     ) -> Result<Option<SessionRouteMetadata>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title
+            "SELECT agent_id, channel, account_id, chat_type, chat_id, route_id, sender_id, title, deliver, hop, trace_id, parent_session_id
              FROM session_meta
              WHERE session_id = ?1",
             params![session_id.as_str()],
@@ -604,6 +610,11 @@ impl SessionStore {
                     route_id: row.get(5)?,
                     sender_id: row.get(6)?,
                     title: row.get(7)?,
+                    deliver: row.get::<_, i64>(8)? != 0,
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    hop: row.get::<_, i64>(9)? as u32,
+                    trace_id: row.get(10)?,
+                    parent_session_id: row.get(11)?,
                 })
             },
         )
@@ -618,7 +629,7 @@ impl SessionStore {
         content: &str,
         meta_json: Option<&str>,
     ) -> Result<()> {
-        let Some(role) = SessionMessageRole::from_str(role) else {
+        let Some(role) = SessionMessageRole::from_str_opt(role) else {
             tracing::warn!(
                 session_id = %session_id.as_str(),
                 role,
@@ -801,6 +812,161 @@ impl SessionStore {
         self.set_state_key(session_id, key, value_json)
     }
 
+    /// Returns the session's active agent id (id or name) if set.
+    pub fn get_active_agent_id(&self, session_id: &SessionId) -> Result<Option<String>> {
+        let raw = self.get_state_key(session_id, SESSION_STATE_ACTIVE_AGENT_ID)?;
+        Ok(Self::decode_state_string(raw))
+    }
+
+    /// Sets the session's active agent id (id or name). Pass empty string to clear.
+    pub fn set_active_agent_id(&self, session_id: &SessionId, id_or_name: &str) -> Result<()> {
+        let value_json =
+            serde_json::to_string(id_or_name).unwrap_or_else(|_| format!("\"{}\"", id_or_name));
+        self.set_state_key(session_id, SESSION_STATE_ACTIVE_AGENT_ID, &value_json)
+    }
+
+    /// Returns the session's model override ("provider/model") if set.
+    pub fn get_model_override(&self, session_id: &SessionId) -> Result<Option<String>> {
+        let raw = self.get_state_key(session_id, SESSION_STATE_MODEL_OVERRIDE)?;
+        Ok(Self::decode_state_string(raw))
+    }
+
+    /// Sets the session's model override ("provider/model"). Pass empty string to clear.
+    pub fn set_model_override(&self, session_id: &SessionId, provider_model: &str) -> Result<()> {
+        let value_json = serde_json::to_string(provider_model)
+            .unwrap_or_else(|_| format!("\"{}\"", provider_model));
+        self.set_state_key(session_id, SESSION_STATE_MODEL_OVERRIDE, &value_json)
+    }
+
+    fn decode_state_string(value_json: Option<String>) -> Option<String> {
+        value_json.and_then(|raw| {
+            serde_json::from_str::<String>(&raw).ok().or_else(|| {
+                let trimmed = raw.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+        })
+    }
+
+    pub fn list_agent_specs(&self, limit: u32) -> Result<Vec<AgentSpec>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, name, config_json, created_at, updated_at
+                 FROM agent_specs
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )
+            .context("Failed to prepare list_agent_specs query")?;
+        let rows = stmt
+            .query_map(params![i64::from(limit)], |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .context("Failed to query agent_specs list")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to decode agent_specs list")
+    }
+
+    pub fn get_agent_spec(&self, agent_id: &str) -> Result<Option<AgentSpec>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE agent_id = ?1",
+            params![agent_id],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query agent_spec by id")
+    }
+
+    pub fn get_agent_spec_by_name(&self, name: &str) -> Result<Option<AgentSpec>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query agent_spec by name")
+    }
+
+    /// Resolve AgentSpec by id or name (exact match). Returns None if not found.
+    pub fn resolve_agent_spec(&self, id_or_name: &str) -> Result<Option<AgentSpec>> {
+        if let Some(spec) = self.get_agent_spec(id_or_name)? {
+            return Ok(Some(spec));
+        }
+        self.get_agent_spec_by_name(id_or_name)
+    }
+
+    pub fn upsert_agent_spec(&self, name: &str, config_json: &str) -> Result<AgentSpec> {
+        let conn = self.conn.lock();
+        let now = Self::now();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO agent_specs (agent_id, name, config_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+                config_json = excluded.config_json,
+                updated_at = excluded.updated_at",
+            params![agent_id, name, config_json, now],
+        )
+        .context("Failed to upsert agent_spec")?;
+
+        conn.query_row(
+            "SELECT agent_id, name, config_json, created_at, updated_at
+             FROM agent_specs
+             WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok(AgentSpec {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to load upserted agent_spec")?
+        .ok_or_else(|| anyhow::anyhow!("Upserted agent_spec missing for name '{name}'"))
+    }
+
+    pub fn delete_agent_spec(&self, agent_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn
+            .execute(
+                "DELETE FROM agent_specs WHERE agent_id = ?1",
+                params![agent_id],
+            )
+            .context("Failed to delete agent_spec")?;
+        Ok(changed > 0)
+    }
+
     pub fn find_chat_candidates_by_title(
         &self,
         title_substring: &str,
@@ -841,30 +1007,39 @@ impl SessionStore {
             .context("Failed to decode title-based session chat candidates")
     }
 
-    pub fn create_subagent_session(
+    pub fn create_subagent_session_with_id(
         &self,
+        subagent_session_id: &str,
         spec_id: Option<&str>,
         meta_json: Option<&str>,
     ) -> Result<SubagentSession> {
         let conn = self.conn.lock();
         let now = Self::now();
-        let subagent_session_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO subagent_sessions (
                 subagent_session_id, spec_id, status, created_at, updated_at, meta_json
              ) VALUES (?1, ?2, 'active', ?3, ?3, ?4)",
             params![subagent_session_id, spec_id, now, meta_json],
         )
-        .context("Failed to create subagent session")?;
+        .context("Failed to create subagent session with id")?;
 
         Ok(SubagentSession {
-            subagent_session_id,
+            subagent_session_id: subagent_session_id.to_string(),
             spec_id: spec_id.map(ToOwned::to_owned),
             status: "active".to_string(),
             created_at: now.clone(),
             updated_at: now,
             meta_json: meta_json.map(ToOwned::to_owned),
         })
+    }
+
+    pub fn create_subagent_session(
+        &self,
+        spec_id: Option<&str>,
+        meta_json: Option<&str>,
+    ) -> Result<SubagentSession> {
+        let subagent_session_id = uuid::Uuid::new_v4().to_string();
+        self.create_subagent_session_with_id(&subagent_session_id, spec_id, meta_json)
     }
 
     pub fn upsert_subagent_spec(&self, name: &str, config_json: &str) -> Result<SubagentSpec> {
@@ -1071,6 +1246,7 @@ impl SessionStore {
         let changes = conn
             .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
             .context("Failed to query recovered subagent run changes")?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Ok(changes.max(0) as usize)
     }
 
@@ -1379,6 +1555,7 @@ impl SessionStore {
         let changes = conn
             .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
             .context("Failed to query recovered exec run changes")?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Ok(changes.max(0) as usize)
     }
 
@@ -1540,6 +1717,7 @@ impl SessionStore {
         .context("Failed to query exec run")
     }
 
+#[allow(clippy::too_many_arguments)]
     fn mark_exec_run_final(
         &self,
         run_id: &str,
@@ -1798,6 +1976,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exec_runs_exists, 1);
+
+        let agent_specs_exists: i64 = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_specs')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_specs_exists, 1);
+    }
+
+    #[test]
+    fn agent_specs_crud_list_get_upsert_delete() {
+        let workspace = TempDir::new().unwrap();
+        let store = SessionStore::new(workspace.path()).unwrap();
+
+        let spec = store
+            .upsert_agent_spec(
+                "coder",
+                r#"{"defaults":{"provider":"openai","model":"gpt-4o"}}"#,
+            )
+            .unwrap();
+        assert_eq!(spec.name, "coder");
+        assert!(spec.agent_id.len() > 0);
+
+        let list = store.list_agent_specs(10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "coder");
+
+        let by_id = store
+            .get_agent_spec(spec.agent_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_id.agent_id, spec.agent_id);
+        let by_name = store.get_agent_spec_by_name("coder").unwrap().unwrap();
+        assert_eq!(by_name.agent_id, spec.agent_id);
+
+        let resolved = store
+            .resolve_agent_spec(spec.agent_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.agent_id, spec.agent_id);
+        let resolved_name = store.resolve_agent_spec("coder").unwrap().unwrap();
+        assert_eq!(resolved_name.name, "coder");
+
+        let session_key = SessionKey::new("group:telegram:chat-agent");
+        let session_id = store.get_or_create_active(&session_key).unwrap();
+        store
+            .set_active_agent_id(&session_id, spec.agent_id.as_str())
+            .unwrap();
+        assert_eq!(
+            store.get_active_agent_id(&session_id).unwrap().as_deref(),
+            Some(spec.agent_id.as_str())
+        );
+        store
+            .set_model_override(&session_id, "openai/gpt-4o")
+            .unwrap();
+        assert_eq!(
+            store.get_model_override(&session_id).unwrap().as_deref(),
+            Some("openai/gpt-4o")
+        );
+
+        let deleted = store.delete_agent_spec(spec.agent_id.as_str()).unwrap();
+        assert!(deleted);
+        assert!(store
+            .get_agent_spec(spec.agent_id.as_str())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1917,6 +2163,9 @@ mod tests {
                     route_id: Some("thread-1".into()),
                     sender_id: "user-a".into(),
                     title: Some("Engineering Group".into()),
+                    deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();
@@ -1936,6 +2185,9 @@ mod tests {
                     route_id: None,
                     sender_id: "user-b".into(),
                     title: Some("operations group".into()),
+                    deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();
@@ -1969,6 +2221,9 @@ mod tests {
                     route_id: Some("thread-1".into()),
                     sender_id: "user-1".into(),
                     title: Some("Ops".into()),
+                    deliver: true,
+                    hop: 0,
+                    trace_id: None,
                 },
             )
             .unwrap();

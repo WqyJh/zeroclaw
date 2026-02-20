@@ -4,10 +4,16 @@ use std::sync::LazyLock;
 
 const DEFAULT_BACKLOG_CAP: usize = 16;
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum BacklogItem {
+    UserMessage(String),
+    Resume { history_json: String },
+}
+
 #[derive(Debug, Default)]
 struct BacklogState {
     active_sessions: HashSet<String>,
-    queues: HashMap<String, VecDeque<String>>,
+    queues: HashMap<String, VecDeque<BacklogItem>>,
 }
 
 static BACKLOG_STATE: LazyLock<Mutex<BacklogState>> =
@@ -23,11 +29,15 @@ pub fn finish_turn(session_key: &str) {
     state.active_sessions.remove(session_key);
 }
 
-pub fn enqueue(session_key: &str, message: impl Into<String>) {
-    enqueue_with_cap(session_key, message.into(), DEFAULT_BACKLOG_CAP);
+pub fn enqueue(session_key: &str, item: BacklogItem) {
+    enqueue_with_cap(session_key, item, DEFAULT_BACKLOG_CAP);
 }
 
-pub fn drain(session_key: &str) -> Vec<String> {
+pub fn enqueue_user_message(session_key: &str, message: impl Into<String>) {
+    enqueue(session_key, BacklogItem::UserMessage(message.into()));
+}
+
+pub fn drain(session_key: &str) -> Vec<BacklogItem> {
     let mut state = BACKLOG_STATE.lock();
     let Some(queue) = state.queues.remove(session_key) else {
         return Vec::new();
@@ -35,7 +45,15 @@ pub fn drain(session_key: &str) -> Vec<String> {
     queue.into_iter().collect()
 }
 
-fn enqueue_with_cap(session_key: &str, message: String, cap: usize) {
+pub fn has_messages(session_key: &str) -> bool {
+    let state = BACKLOG_STATE.lock();
+    state
+        .queues
+        .get(session_key)
+        .map_or(false, |q| !q.is_empty())
+}
+
+fn enqueue_with_cap(session_key: &str, item: BacklogItem, cap: usize) {
     if cap == 0 {
         return;
     }
@@ -44,11 +62,11 @@ fn enqueue_with_cap(session_key: &str, message: String, cap: usize) {
     let queue = state
         .queues
         .entry(session_key.to_string())
-        .or_insert_with(VecDeque::new);
+        .or_default();
     if queue.len() >= cap {
         let _ = queue.pop_front();
     }
-    queue.push_back(message);
+    queue.push_back(item);
 }
 
 #[cfg(test)]
@@ -60,28 +78,53 @@ pub fn clear() {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear, drain, enqueue, enqueue_with_cap};
+    use super::{clear, drain, enqueue_user_message, enqueue_with_cap, BacklogItem};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_session_key(prefix: &str) -> String {
+        let n = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{n}")
+    }
 
     #[test]
     fn backlog_enqueue_drain_preserves_order() {
         clear();
-        enqueue("session-a", "first");
-        enqueue("session-a", "second");
-        enqueue("session-a", "third");
+        let session_key = unique_session_key("session-a");
 
-        let drained = drain("session-a");
-        assert_eq!(drained, vec!["first", "second", "third"]);
-        assert!(drain("session-a").is_empty());
+        enqueue_user_message(&session_key, "first");
+        enqueue_user_message(&session_key, "second");
+        enqueue_user_message(&session_key, "third");
+
+        let drained = drain(&session_key);
+        assert_eq!(
+            drained,
+            vec![
+                BacklogItem::UserMessage("first".into()),
+                BacklogItem::UserMessage("second".into()),
+                BacklogItem::UserMessage("third".into())
+            ]
+        );
+        assert!(drain(&session_key).is_empty());
     }
 
     #[test]
     fn backlog_enqueue_drops_oldest_when_cap_reached() {
         clear();
-        enqueue_with_cap("session-b", "m1".to_string(), 2);
-        enqueue_with_cap("session-b", "m2".to_string(), 2);
-        enqueue_with_cap("session-b", "m3".to_string(), 2);
+        let session_key = unique_session_key("session-b");
 
-        let drained = drain("session-b");
-        assert_eq!(drained, vec!["m2", "m3"]);
+        enqueue_with_cap(&session_key, BacklogItem::UserMessage("m1".to_string()), 2);
+        enqueue_with_cap(&session_key, BacklogItem::UserMessage("m2".to_string()), 2);
+        enqueue_with_cap(&session_key, BacklogItem::UserMessage("m3".to_string()), 2);
+
+        let drained = drain(&session_key);
+        assert_eq!(
+            drained,
+            vec![
+                BacklogItem::UserMessage("m2".into()),
+                BacklogItem::UserMessage("m3".into())
+            ]
+        );
     }
 }

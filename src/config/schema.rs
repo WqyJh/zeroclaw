@@ -63,6 +63,9 @@ pub struct Config {
     pub session: SessionConfig,
 
     #[serde(default)]
+    pub queue: QueueConfig,
+
+    #[serde(default)]
     pub gateway: GatewayConfig,
 
     #[serde(default)]
@@ -82,39 +85,6 @@ pub struct Config {
 
     #[serde(default)]
     pub cost: CostConfig,
-
-    /// Legacy delegate agent configurations.
-    /// Deprecated: entries are mapped into subagent specs for compatibility.
-    #[serde(default)]
-    pub agents: HashMap<String, DelegateAgentConfig>,
-}
-
-// ── Delegate Agents ──────────────────────────────────────────────
-
-/// Configuration for a legacy delegate agent entry in config.
-/// Deprecated: parsed for compatibility and mapped to subagent specs at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DelegateAgentConfig {
-    /// Provider name (e.g. "ollama", "openrouter", "anthropic")
-    pub provider: String,
-    /// Model name
-    pub model: String,
-    /// Optional system prompt for the sub-agent
-    #[serde(default)]
-    pub system_prompt: Option<String>,
-    /// Optional API key override
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Temperature override
-    #[serde(default)]
-    pub temperature: Option<f64>,
-    /// Max recursion depth for nested delegation
-    #[serde(default = "default_max_depth")]
-    pub max_depth: u32,
-}
-
-fn default_max_depth() -> u32 {
-    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -573,7 +543,7 @@ fn default_http_timeout_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// Memory backend key (sqlite-only; other values are accepted for compatibility but ignored).
     pub backend: String,
     /// Auto-save conversation context to memory
     pub auto_save: bool,
@@ -721,6 +691,32 @@ impl Default for SessionConfig {
         Self {
             enabled: false,
             history_limit: default_session_history_limit(),
+        }
+    }
+}
+
+// ── Queueing ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueMode {
+    SteerBacklog,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueConfig {
+    #[serde(default = "default_queue_mode")]
+    pub mode: QueueMode,
+}
+
+fn default_queue_mode() -> QueueMode {
+    QueueMode::SteerBacklog
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_queue_mode(),
         }
     }
 }
@@ -1538,6 +1534,7 @@ impl Default for Config {
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             session: SessionConfig::default(),
+            queue: QueueConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
@@ -2199,7 +2196,7 @@ default_temperature = 0.7
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            agents: HashMap::new(),
+            queue: QueueConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2306,7 +2303,7 @@ tool_dispatcher = "xml"
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            agents: HashMap::new(),
+            queue: QueueConfig::default(),
         };
 
         config.save().unwrap();
@@ -2342,18 +2339,6 @@ tool_dispatcher = "xml"
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
 
-        config.agents.insert(
-            "worker".into(),
-            DelegateAgentConfig {
-                provider: "openrouter".into(),
-                model: "model-test".into(),
-                system_prompt: None,
-                api_key: Some("agent-credential".into()),
-                temperature: None,
-                max_depth: 3,
-            },
-        );
-
         config.save().unwrap();
 
         let contents = fs::read_to_string(config.config_path.clone()).unwrap();
@@ -2381,11 +2366,6 @@ tool_dispatcher = "xml"
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
         );
-
-        let worker = stored.agents.get("worker").unwrap();
-        let worker_encrypted = worker.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(worker_encrypted));
-        assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
         let _ = fs::remove_dir_all(&dir);
     }

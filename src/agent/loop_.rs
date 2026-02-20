@@ -1,5 +1,6 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
+use crate::identity;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
@@ -229,17 +230,13 @@ fn maybe_bind_source_session_id(
         return arguments;
     };
 
-    if !matches!(tool_name, "cron_add" | "cron_update" | "schedule" | "shell") {
+    if !matches!(tool_name, "cron_add" | "cron_update" | "schedule" | "shell" | "subagent_spawn") {
         return arguments;
     }
 
     match arguments {
         serde_json::Value::Object(mut obj) => {
-            let field_name = if tool_name == "shell" {
-                "session_id"
-            } else {
-                "source_session_id"
-            };
+            let field_name = "source_session_id";
             obj.entry(field_name.to_string())
                 .or_insert_with(|| serde_json::Value::String(source_session_id.to_string()));
             serde_json::Value::Object(obj)
@@ -502,15 +499,27 @@ fn inject_backlog_messages(history: &mut Vec<ChatMessage>, backlog_key: Option<&
         return 0;
     };
 
-    let backlog_messages = crate::session::backlog::drain(session_key);
-    if !backlog_messages.is_empty() {
+    let backlog_items = crate::session::backlog::drain(session_key);
+    if backlog_items.is_empty() {
+        return 0;
+    }
+
+    let user_messages: Vec<String> = backlog_items
+        .into_iter()
+        .filter_map(|item| match item {
+            crate::session::backlog::BacklogItem::UserMessage(content) => Some(content),
+            crate::session::backlog::BacklogItem::Resume { .. } => None,
+        })
+        .collect();
+
+    if !user_messages.is_empty() {
         history.push(ChatMessage::user(format!(
             "[Backlog]\n{}",
-            backlog_messages.join("\n")
+            user_messages.join("\n")
         )));
     }
 
-    backlog_messages.len()
+    user_messages.len()
 }
 
 #[derive(Debug)]
@@ -724,7 +733,17 @@ pub(crate) async fn run_tool_call_loop(
         // Add assistant message with tool calls + tool results to history
         history.push(ChatMessage::assistant(assistant_history_content));
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
-        let _ = inject_backlog_messages(history, backlog_key);
+
+        if let Some(key) = backlog_key {
+            if crate::session::backlog::has_messages(key) {
+                let history_json = serde_json::to_string(history).unwrap_or_default();
+                crate::session::backlog::enqueue(
+                    key,
+                    crate::session::backlog::BacklogItem::Resume { history_json },
+                );
+                return Ok("[Task preempted by new message; will resume from backlog]".to_string());
+            }
+        }
     }
 
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
@@ -795,6 +814,20 @@ pub async fn run(
     } else {
         (None, None)
     };
+    let aieos_identity = identity::load_aieos_identity(&config.identity, &config.workspace_dir)
+        .ok()
+        .flatten();
+
+    let (allowed_skills, allowed_tools) = if let Some(ref identity) = aieos_identity {
+        if let Some(ref capabilities) = identity.capabilities {
+            (capabilities.skills.clone(), capabilities.tools.clone())
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -805,9 +838,9 @@ pub async fn run(
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
-        &config.agents,
         config.api_key.as_deref(),
         &config,
+        allowed_tools,
     );
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -836,7 +869,7 @@ pub async fn run(
     });
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills(&config.workspace_dir, allowed_skills);
     let tool_prompt_entries: Vec<(&str, &str)> = tools_registry
         .iter()
         .map(|tool| (tool.name(), tool.description()))
@@ -1053,6 +1086,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
+    let aieos_identity = identity::load_aieos_identity(&config.identity, &config.workspace_dir)
+        .ok()
+        .flatten();
+
+    let (allowed_skills, allowed_tools) = if let Some(ref identity) = aieos_identity {
+        if let Some(ref capabilities) = identity.capabilities {
+            (capabilities.skills.clone(), capabilities.tools.clone())
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -1063,9 +1110,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
-        &config.agents,
         config.api_key.as_deref(),
         &config,
+        allowed_tools,
     );
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -1081,7 +1128,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
     )?;
 
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills(&config.workspace_dir, allowed_skills);
     let tool_prompt_entries: Vec<(&str, &str)> = tools_registry
         .iter()
         .map(|tool| (tool.name(), tool.description()))
@@ -1154,8 +1201,8 @@ mod tests {
     fn inject_backlog_messages_drains_and_merges_into_single_user_message() {
         let session_key = "session-checkpoint-merge";
         let _ = crate::session::backlog::drain(session_key);
-        crate::session::backlog::enqueue(session_key, "steer one");
-        crate::session::backlog::enqueue(session_key, "steer two");
+        crate::session::backlog::enqueue_user_message(session_key, "steer one");
+        crate::session::backlog::enqueue_user_message(session_key, "steer two");
 
         let mut history = vec![
             ChatMessage::system("system"),
@@ -1174,7 +1221,7 @@ mod tests {
     fn inject_backlog_messages_noop_without_key() {
         let session_key = "session-noop-without-key";
         let _ = crate::session::backlog::drain(session_key);
-        crate::session::backlog::enqueue(session_key, "ignored");
+        crate::session::backlog::enqueue_user_message(session_key, "ignored");
 
         let mut history = vec![ChatMessage::system("system")];
         let injected = inject_backlog_messages(&mut history, None);
@@ -1182,7 +1229,12 @@ mod tests {
         assert_eq!(injected, 0);
         assert_eq!(history.len(), 1);
         let pending = crate::session::backlog::drain(session_key);
-        assert_eq!(pending, vec!["ignored"]);
+        assert_eq!(
+            pending,
+            vec![crate::session::backlog::BacklogItem::UserMessage(
+                "ignored".into()
+            )]
+        );
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;

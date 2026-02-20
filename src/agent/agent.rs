@@ -238,6 +238,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None,
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -278,7 +279,7 @@ impl Agent {
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills(&config.workspace_dir))
+            .skills(crate::skills::load_skills(&config.workspace_dir, None))
             .auto_save(config.memory.auto_save)
             .build()
     }
@@ -586,12 +587,12 @@ mod tests {
         });
 
         let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
+            backend: "sqlite".into(),
             ..crate::config::MemoryConfig::default()
         };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
-        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap());
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -600,7 +601,7 @@ mod tests {
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(tmp.path().to_path_buf())
             .build()
             .unwrap();
 
@@ -628,12 +629,12 @@ mod tests {
         });
 
         let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
+            backend: "sqlite".into(),
             ..crate::config::MemoryConfig::default()
         };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None).unwrap(),
-        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&memory_cfg, tmp.path(), None).unwrap());
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -642,7 +643,7 @@ mod tests {
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(tmp.path().to_path_buf())
             .build()
             .unwrap();
 
